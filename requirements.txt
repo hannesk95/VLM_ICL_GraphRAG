@@ -1,0 +1,16 @@
+numpy>=1.26
+pandas>=2.0
+openpyxl>=3.1
+scipy>=1.11
+scikit-learn>=1.3
+nibabel>=5.0
+pillow>=10.1
+networkx>=3.0
+tqdm
+tabulate
+# --- only needed for the real MedGemma / MedSigLIP back-ends ---
+torch>=2.2
+transformers>=4.50.0   # Gemma 3 support starts at 4.50.0
+accelerate
+# huggingface-cli login  (the MedGemma / MedSigLIP repos are gated; accept the HAI-DEF terms first)
+# pytest   (for tests/)
