@@ -1,3 +1,6 @@
+# Install pytorch first
+# pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
 numpy>=1.26
 pandas>=2.0
 openpyxl>=3.1
@@ -9,7 +12,7 @@ networkx>=3.0
 tqdm
 tabulate
 # --- only needed for the real MedGemma / MedSigLIP back-ends ---
-torch>=2.2
+# torch>=2.2
 transformers>=4.50.0   # Gemma 3 support starts at 4.50.0
 accelerate
 # huggingface-cli login  (the MedGemma / MedSigLIP repos are gated; accept the HAI-DEF terms first)
