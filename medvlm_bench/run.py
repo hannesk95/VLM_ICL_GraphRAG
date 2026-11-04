@@ -80,8 +80,20 @@ def build_registry() -> dict[str, Condition]:
         for src in ("seg", "vlm"):
             add(Condition(f"rag_{rag}_{src}", rag=rag, findings_source=src))
     add(Condition("rag_graph_both", rag="graph", findings_source="both"))
-    add(Condition("combo_graph_seg_icl_graph_k4", k=4, selector="graph", rag="graph", findings_source="seg"))
-    add(Condition("combo_graph_vlm_icl_graph_k4", k=4, selector="graph", rag="graph", findings_source="vlm"))
+    # add(Condition("combo_graph_seg_icl_graph_k4", k=4, selector="graph", rag="graph", findings_source="seg"))
+    # add(Condition("combo_graph_vlm_icl_graph_k4", k=4, selector="graph", rag="graph", findings_source="vlm"))
+
+    for k in (1, 2, 4, 8):
+        add(Condition(f"combo_graph_seg_icl_graph_k{k}", k=k, selector="graph",
+                    rag="graph", findings_source="seg"))
+        add(Condition(f"combo_graph_vlm_icl_graph_k{k}", k=k, selector="graph",
+                    rag="graph", findings_source="vlm"))
+
+    for k in (1, 2, 4, 8):
+        add(Condition(f"combo_graph_seg_icl_graph_k{k}_multiimage", k=k, selector="graph",
+                    rag="graph", findings_source="seg",
+                    render=RenderConfig(layout="slices")))
+
     return R
 
 
@@ -211,16 +223,17 @@ def run_condition(cond: Condition, split: str, ctx: Context, limit: int | None =
     queries = cases_from_df(ctx.df, split)
     if limit:
         queries = queries[:limit]
+    name = f"{cond.name}@{ctx.embedder.name}" if cond.k > 0 else cond.name  # exemplar retrieval depends on the embedder
     for seed in cond.seeds if only_seed is None else (only_seed,):
-        f = ctx.out / "predictions" / split / f"{cond.name}__s{seed}.csv"
+        f = ctx.out / "predictions" / split / f"{name}__s{seed}.csv"
         f.parent.mkdir(parents=True, exist_ok=True)
         done = set(pd.read_csv(f).pid) if f.exists() else set()
         selector = None
         if cond.k > 0:
             selector = ExemplarSelector(ctx.train, ctx.train_emb, cond.selector, seed, cond.order, ctx.graph)
         todo = [c for c in queries if c.pid not in done]
-        for c in tqdm(todo, desc=f"{cond.name} s{seed} [{split}]"):
-            row = dict(condition=cond.name, seed=seed, split=split, pid=c.pid, y=c.y)
+        for c in tqdm(todo, desc=f"{name} s{seed} [{split}]"):
+            row = dict(condition=name, seed=seed, split=split, pid=c.pid, y=c.y)
             row.update(predict_case(cond, c, seed, ctx, selector))
             pd.DataFrame([row]).to_csv(f, mode="a", header=not f.exists(), index=False)  # incremental / resumable
 
@@ -243,6 +256,7 @@ def run_references(ctx: Context, split: str, limit: int | None = None):
     if ctx.graph is not None:
         preds["ref_labelprop"] = np.array([ctx.graph.prior(e) for e in Eq])
     for name, p in preds.items():
+        name = f"{name}@{ctx.embedder.name}"
         df = pd.DataFrame(dict(condition=name, seed=0, split=split, pid=[c.pid for c in queries],
                                y=[c.y for c in queries], p_pos=p, p_pos_o0=p, p_pos_o1=np.nan,
                                option_mass=1.0, n_images=0, n_shots=0, shot_pids="", shot_ys=""))

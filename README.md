@@ -39,6 +39,9 @@ python -m medvlm_bench.evaluate --out runs/exp1 --ref zs_v0
 `--root` is the folder with `UCSF-PDGM-metadata_v5.xlsx` and `MRI/`. Runs are **resumable** (each case is
 appended to its CSV; re-running skips finished cases). Use `--limit 10` for a dry run and `--backend mock`
 to test without a GPU. `pytest -q tests/` runs the whole pipeline on synthetic data.
+Conditions that depend on the case embedding (ICL with k > 0, references) are saved with the embedder
+appended, e.g. `icl_knn_k4@handcrafted` or `ref_logreg@medsiglip` (`--embedder`), so runs with different embedders
+can share one `--out` folder.
 
 ## Data handling (important while the copy is still running)
 

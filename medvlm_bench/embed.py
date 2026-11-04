@@ -70,6 +70,9 @@ class MedSigLIPEmbedder:
             for c in cases:
                 imgs = render_case(c, self.cfg, self.cache_dir)
                 px = self.processor(images=imgs, return_tensors="pt")["pixel_values"].to(self.device)
-                e = self.model.get_image_features(pixel_values=px).float().mean(0).cpu().numpy()
+                e = self.model.get_image_features(pixel_values=px)
+                if not isinstance(e, self.torch.Tensor):  # transformers>=5 returns BaseModelOutputWithPooling
+                    e = e.pooler_output
+                e = e.float().mean(0).cpu().numpy()
                 out.append(e)
         return _l2(np.stack(out))
