@@ -19,3 +19,4 @@ sentencepiece
 protobuf
 # huggingface-cli login  (the MedGemma / MedSigLIP repos are gated; accept the HAI-DEF terms first)
 # pytest   (for tests/)
+reportlab>=5.1.0
