@@ -12,8 +12,10 @@ Usage (from the VLM_ICL_GraphRAG folder)
 from __future__ import annotations
 
 import argparse
+import datetime
 import fnmatch
 import json
+import os
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -28,6 +30,7 @@ from .icl import STRATEGIES, ExemplarSelector
 from .imaging import RenderConfig, compute_case_features, features_to_text, findings_from_features, render_case
 from .kg import KnowledgeGraph, VectorRAG
 from .prompts import GLIOMA_GRADE, TaskSpec, build_messages, n_images, yes_no_messages
+from .promptpdf import messages_to_pdf
 
 try:
     from tqdm import tqdm
@@ -66,16 +69,21 @@ def build_registry() -> dict[str, Condition]:
     add(Condition("zs_multiimage", render=RenderConfig(layout="slices")))
     add(Condition("zs_uniform", render=RenderConfig(slice_mode="uniform")))
     add(Condition("zs_t1c_only", render=RenderConfig(seqs=("T1c",), n_slices=3)))
+    
     for sel in STRATEGIES:
-        for k in (1, 2, 4, 8):
+        for k in (1, 2, 3, 4, 5, 8, 10):
             add(Condition(f"icl_{sel}_k{k}", k=k, selector=sel,
                           seeds=(0, 1, 2) if sel in ("random", "balanced") else (0,)))
+            add(Condition(f"icl_{sel}_k{k}_multiimage", k=k, selector=sel,
+                          seeds=(0, 1, 2) if sel in ("random", "balanced") else (0,), render=RenderConfig(layout="slices")))
     add(Condition("icl_knn_k4_findings", k=4, selector="knn", shot_format="findings"))
+    
     for k in (2, 4, 8):
         add(Condition(f"icl_knn_k{k}_single", k=k, selector="knn", single_turn=True))
     add(Condition("icl_random_k4_single", k=4, selector="random", single_turn=True, seeds=(0, 1, 2)))
     add(Condition("icl_knn_k4_randlabels", k=4, selector="knn", shuffle_labels=True, seeds=(0, 1, 2)))
     add(Condition("icl_knn_k4_orderrandom", k=4, selector="knn", order="random", seeds=(0, 1, 2)))
+    
     for rag in ("graph", "vector", "random_graph", "full"):
         for src in ("seg", "vlm"):
             add(Condition(f"rag_{rag}_{src}", rag=rag, findings_source=src))
@@ -186,7 +194,7 @@ class Context:
 
 
 # ------------------------------------------------------------------------------- inference
-def predict_case(cond: Condition, case: Case, seed: int, ctx: Context, selector: ExemplarSelector | None) -> dict:
+def predict_case(cond: Condition, case: Case, seed: int, ctx: Context, selector: ExemplarSelector | None, prompt_dir: Path) -> dict:
     cfg = cond.render
     q_imgs = ctx.images(case, cfg)
     layout = cfg.describe()
@@ -206,6 +214,7 @@ def predict_case(cond: Condition, case: Case, seed: int, ctx: Context, selector:
     ps, mass, nimg = [], [], 0
     for swap in ((False, True) if cond.counterbalance else (False,)):
         msgs = build_messages(ctx.task, layout, q_imgs, shots, evidence, q_ftxt, cond.variant, swap, cond.single_turn)
+        messages_to_pdf(msgs, os.path.join(prompt_dir, f"{cond.name}_prompt_{case.pid}.pdf"), title=f"{cond.name} | {case.pid} (true grade {case.y})")
         lp = ctx.scorer.option_logprobs(msgs, ("A", "B"))
         e = np.exp(lp - lp.max())
         pA = float(e[0] / e.sum())
@@ -227,6 +236,12 @@ def run_condition(cond: Condition, split: str, ctx: Context, limit: int | None =
     for seed in cond.seeds if only_seed is None else (only_seed,):
         f = ctx.out / "predictions" / split / f"{name}__s{seed}.csv"
         f.parent.mkdir(parents=True, exist_ok=True)
+
+        prompt_dir = ctx.out / "prompts"
+        # make it a absolute path
+        prompt_dir = prompt_dir.resolve()
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+
         done = set(pd.read_csv(f).pid) if f.exists() else set()
         selector = None
         if cond.k > 0:
@@ -234,7 +249,7 @@ def run_condition(cond: Condition, split: str, ctx: Context, limit: int | None =
         todo = [c for c in queries if c.pid not in done]
         for c in tqdm(todo, desc=f"{name} s{seed} [{split}]"):
             row = dict(condition=name, seed=seed, split=split, pid=c.pid, y=c.y)
-            row.update(predict_case(cond, c, seed, ctx, selector))
+            row.update(predict_case(cond, c, seed, ctx, selector, prompt_dir))
             pd.DataFrame([row]).to_csv(f, mode="a", header=not f.exists(), index=False)  # incremental / resumable
 
 
@@ -296,7 +311,7 @@ def main(argv=None):
             p.add_argument("--limit", type=int, default=None)
             p.add_argument("--backend", default="medgemma", choices=["medgemma", "mock"])
             p.add_argument("--model-id", default="google/medgemma-1.5-4b-it")
-            p.add_argument("--embedder", default="handcrafted", choices=["handcrafted", "medsiglip"])
+            p.add_argument("--embedder", default="medsiglip", choices=["handcrafted", "medsiglip"])
         if name == "run":
             p.add_argument("--conditions", nargs="+", required=True, help="names or fnmatch patterns")
             p.add_argument("--seed", type=int, default=None, help="run a single seed of stochastic conditions")
@@ -307,6 +322,11 @@ def main(argv=None):
         for n, c in reg.items():
             print(f"{n:38s} k={c.k} sel={c.selector if c.k else '-':14s} rag={c.rag:12s} seeds={list(c.seeds)}")
         return
+
+    # set a.out to current date and time
+    # import datetime
+    # a.out = datetime.datetime.now().strftime("runs/%Y-%m-%d_%H-%M-%S")
+
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     df = _make_df(a)
     df.to_csv(out / "index.csv", index=False)
