@@ -89,12 +89,10 @@ def scan_mri_dir(mri_dir: str | Path) -> tuple[dict, list[str]]:
     return found, ignored
 
 
-def assign_splits(meta: pd.DataFrame, seed: int = 0, fractions=(0.6, 0.1, 0.3)) -> pd.Series:
-    """Stratified (grade-4 x IDH status) patient-level train/val/test split on ALL patients."""
-    tr, va, te = fractions
-    assert abs(tr + va + te - 1) < 1e-6
+def _strata(meta: pd.DataFrame) -> pd.Series:
+    """Stratification key (grade-4 x IDH status); tiny strata (<10 patients) are merged into the largest
+    stratum of the same grade group."""
     strat = meta["y"].astype(str) + "_" + meta["idh"]
-    # tiny strata (<10 patients) are merged into the largest stratum of the same grade group
     vc = strat.value_counts()
     for s in vc.index[vc < 10]:
         same_y = [t for t in vc.index if t.split("_")[0] == s.split("_")[0] and vc[t] >= 10]
@@ -102,6 +100,40 @@ def assign_splits(meta: pd.DataFrame, seed: int = 0, fractions=(0.6, 0.1, 0.3)) 
             strat = strat.replace(s, same_y[0])
         else:
             strat = strat.replace(s, s.split("_")[0] + "_all")
+    return strat
+
+
+def assign_folds(meta: pd.DataFrame, n_folds: int = 5, seed: int = 0) -> pd.Series:
+    """Stratified (grade-4 x IDH) patient-level K-fold assignment on ALL patients (0 .. n_folds-1).
+    Every patient is in exactly one test fold, and the assignment does not depend on which files exist."""
+    from sklearn.model_selection import StratifiedKFold
+
+    folds = pd.Series(-1, index=meta.index)
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    for k, (_, te) in enumerate(skf.split(np.zeros(len(meta)), _strata(meta))):
+        folds.iloc[te] = k
+    return folds
+
+
+def splits_for_fold(meta: pd.DataFrame, folds: pd.Series, fold: int, val_fraction: float = 0.15,
+                    seed: int = 0) -> pd.Series:
+    """Fold `fold` is the test set; the remaining patients are split (stratified) into train and val.
+    Val is only used to choose the decision threshold, exactly as in the single-split design."""
+    strat = _strata(meta)
+    te = (folds == fold).values
+    rest = np.where(~te)[0]
+    tr, va = train_test_split(rest, test_size=val_fraction, stratify=strat.iloc[rest], random_state=seed + fold)
+    s = pd.Series("", index=meta.index)
+    s.iloc[tr], s.iloc[va] = "train", "val"
+    s[te] = "test"
+    return s
+
+
+def assign_splits(meta: pd.DataFrame, seed: int = 0, fractions=(0.6, 0.1, 0.3)) -> pd.Series:
+    """Stratified (grade-4 x IDH status) patient-level train/val/test split on ALL patients."""
+    tr, va, te = fractions
+    assert abs(tr + va + te - 1) < 1e-6
+    strat = _strata(meta)
     idx = np.arange(len(meta))
     idx_trval, idx_te = train_test_split(idx, test_size=te, stratify=strat, random_state=seed)
     idx_tr, idx_va = train_test_split(
@@ -118,6 +150,9 @@ def index_dataset(
     require_seg: bool = True,
     seed: int = 0,
     fractions=(0.6, 0.1, 0.3),
+    n_folds: int | None = None,
+    fold: int = 0,
+    val_fraction: float = 0.15,
 ) -> pd.DataFrame:
     """Build the case table. ``root`` is the folder containing the metadata xlsx and ``MRI/``."""
     root = Path(root)
@@ -125,7 +160,12 @@ def index_dataset(
     if not xlsx:
         raise FileNotFoundError(f"No UCSF-PDGM-metadata*.xlsx in {root}")
     meta, _ = load_metadata(xlsx[-1])
-    meta["split"] = assign_splits(meta, seed=seed, fractions=fractions)
+    if n_folds:  # stratified K-fold cross-validation: `fold` is the test fold
+        assert 0 <= fold < n_folds, f"fold must be in [0, {n_folds - 1}]"
+        meta["fold"] = assign_folds(meta, n_folds, seed)
+        meta["split"] = splits_for_fold(meta, meta["fold"], fold, val_fraction, seed)
+    else:
+        meta["split"] = assign_splits(meta, seed=seed, fractions=fractions)
     files, _ = scan_mri_dir(root / "MRI")
     for key in (*SEQS, "seg", "seg_merged"):
         meta[f"path_{key}"] = meta.pid.map(lambda p, k=key: files.get(p, {}).get(k))

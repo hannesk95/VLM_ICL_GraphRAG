@@ -120,9 +120,9 @@ def select_conditions(patterns, registry) -> list[Condition]:
 # ------------------------------------------------------------------------------- context
 class Context:
     def __init__(self, df: pd.DataFrame, scorer, out_dir: Path, embedder=None, task: TaskSpec = GLIOMA_GRADE,
-                 kg_path=None, seed: int = 0):
+                 kg_path=None, seed: int = 0, cache_dir=None):
         self.df, self.scorer, self.out, self.task = df, scorer, Path(out_dir), task
-        self.cache = self.out / "cache"
+        self.cache = Path(cache_dir) if cache_dir else self.out / "cache"  # fold-independent -> shared across folds
         self.train = cases_from_df(df, "train")
         if not self.train:
             raise SystemExit("No complete TRAIN cases available yet - copy more data or relax --require.")
@@ -284,7 +284,8 @@ def run_references(ctx: Context, split: str, limit: int | None = None):
 # ------------------------------------------------------------------------------- CLI
 def _make_df(args) -> pd.DataFrame:
     req = tuple(args.require.split(",")) if args.require else ("T1c", "FLAIR", "T2")
-    return index_dataset(args.root, required_seqs=req, require_seg=not args.no_seg_required, seed=args.split_seed)
+    return index_dataset(args.root, required_seqs=req, require_seg=not args.no_seg_required, seed=args.split_seed,
+                         n_folds=args.n_folds, fold=args.fold, val_fraction=args.val_fraction)
 
 
 def _make_scorer(args):
@@ -306,6 +307,11 @@ def main(argv=None):
         p.add_argument("--require", default="", help="comma-separated sequences every case must have (default T1c,FLAIR,T2)")
         p.add_argument("--no-seg-required", action="store_true")
         p.add_argument("--split-seed", type=int, default=0)
+        p.add_argument("--n-folds", type=int, default=None,
+                       help="stratified K-fold CV instead of the single 60/10/30 split; use with --fold")
+        p.add_argument("--fold", type=int, default=0, help="test fold (0..n_folds-1); results go to <out>/fold<k>")
+        p.add_argument("--val-fraction", type=float, default=0.15,
+                       help="CV only: share of the non-test patients used as validation (threshold selection)")
         if name != "index":
             p.add_argument("--split", default="test", choices=["train", "val", "test"])
             p.add_argument("--limit", type=int, default=None)
@@ -328,6 +334,9 @@ def main(argv=None):
     # a.out = datetime.datetime.now().strftime("runs/%Y-%m-%d_%H-%M-%S")
 
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    cache = out / "cache"  # renders / features / VLM findings do not depend on the fold -> shared
+    if a.n_folds:
+        out = out / f"fold{a.fold}"; out.mkdir(parents=True, exist_ok=True)
     df = _make_df(a)
     df.to_csv(out / "index.csv", index=False)
     print(summarize(df).to_string())
@@ -337,8 +346,8 @@ def main(argv=None):
     emb = None
     if a.embedder == "medsiglip":
         from .embed import MedSigLIPEmbedder
-        emb = MedSigLIPEmbedder(RenderConfig(), cache_dir=out / "cache" / "renders")
-    ctx = Context(df, scorer, out, emb, seed=a.split_seed)
+        emb = MedSigLIPEmbedder(RenderConfig(), cache_dir=cache / "renders")
+    ctx = Context(df, scorer, out, emb, seed=a.split_seed, cache_dir=cache)
     if a.cmd == "refs":
         run_references(ctx, a.split, a.limit)
         return
