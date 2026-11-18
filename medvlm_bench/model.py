@@ -90,7 +90,7 @@ class MedGemmaScorer:
         """Full-vocabulary log-probabilities of the option tokens at the first answer position."""
         inputs = self._prep(messages)
         with self.torch.inference_mode():
-            logits = self.model(**inputs).logits[0, -1].float()
+            logits = self.model(**inputs, logits_to_keep=1).logits[0, -1].float()
         lp = self.torch.log_softmax(logits, dim=-1)
         return lp[self._option_ids(tuple(options))].cpu().numpy()
 
