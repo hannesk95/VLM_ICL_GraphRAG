@@ -24,6 +24,7 @@ SEQS = ("T1", "T1c", "T2", "FLAIR")
 _IMG_RE = re.compile(r"^(UCSF-PDGM-\d{4})_(T1c|T1|T2|FLAIR)_bias\.nii\.gz$")
 _SEG_RE = re.compile(r"^(UCSF-PDGM-\d{4})_tumor_segmentation(_merged)?\.nii\.gz$")
 _ID_RE = re.compile(r"^UCSF-PDGM-(\d+)$")
+_ID4_RE = re.compile(r"^UCSF-PDGM-\d{4}$")
 
 COLMAP = {
     "ID": "pid_raw",
@@ -35,6 +36,16 @@ COLMAP = {
     "1p/19q": "codel_1p19q",
     "IDH": "idh_raw",
 }
+
+
+def pid_key(pid: str) -> int:
+    """Stable integer derived from a patient ID (seeds the per-case random generators).
+    UCSF-PDGM-0283 -> 283 (as before); IDs of the other datasets (HN1004, DUKE_001, KiTS-00094, Sar001 ...) are
+    hashed, because int(pid[-4:]) is not defined for them."""
+    if _ID4_RE.match(pid):
+        return int(pid[-4:])
+    import zlib
+    return zlib.crc32(pid.encode()) % 100_000
 
 
 def norm_id(raw) -> str | None:
@@ -144,6 +155,16 @@ def assign_splits(meta: pd.DataFrame, seed: int = 0, fractions=(0.6, 0.1, 0.3)) 
     return s
 
 
+def _with_splits(meta, seed, fractions, n_folds, fold, val_fraction):
+    if n_folds:  # stratified K-fold cross-validation: `fold` is the test fold
+        assert 0 <= fold < n_folds, f"fold must be in [0, {n_folds - 1}]"
+        meta["fold"] = assign_folds(meta, n_folds, seed)
+        meta["split"] = splits_for_fold(meta, meta["fold"], fold, val_fraction, seed)
+    else:
+        meta["split"] = assign_splits(meta, seed=seed, fractions=fractions)
+    return meta
+
+
 def index_dataset(
     root: str | Path,
     required_seqs=("T1c", "FLAIR", "T2"),
@@ -153,19 +174,20 @@ def index_dataset(
     n_folds: int | None = None,
     fold: int = 0,
     val_fraction: float = 0.15,
+    task: str = "brain",
 ) -> pd.DataFrame:
-    """Build the case table. ``root`` is the folder containing the metadata xlsx and ``MRI/``."""
+    """Build the case table. ``root`` is the folder containing the metadata xlsx and ``MRI/`` (brain), or the
+    dataset folder of another task (see tasks.py: head-neck, breast, liver, kidney, soft-tissue)."""
     root = Path(root)
+    if task != "brain":
+        from .tasks import get_task
+        meta = get_task(task).load(root)  # standard columns + path_<seq> + path_seg + complete
+        return _with_splits(meta, seed, fractions, n_folds, fold, val_fraction)
     xlsx = sorted(root.glob("UCSF-PDGM-metadata*.xlsx"))
     if not xlsx:
         raise FileNotFoundError(f"No UCSF-PDGM-metadata*.xlsx in {root}")
     meta, _ = load_metadata(xlsx[-1])
-    if n_folds:  # stratified K-fold cross-validation: `fold` is the test fold
-        assert 0 <= fold < n_folds, f"fold must be in [0, {n_folds - 1}]"
-        meta["fold"] = assign_folds(meta, n_folds, seed)
-        meta["split"] = splits_for_fold(meta, meta["fold"], fold, val_fraction, seed)
-    else:
-        meta["split"] = assign_splits(meta, seed=seed, fractions=fractions)
+    meta = _with_splits(meta, seed, fractions, n_folds, fold, val_fraction)
     files, _ = scan_mri_dir(root / "MRI")
     for key in (*SEQS, "seg", "seg_merged"):
         meta[f"path_{key}"] = meta.pid.map(lambda p, k=key: files.get(p, {}).get(k))
@@ -191,7 +213,7 @@ def cases_from_df(df: pd.DataFrame, split: str | None = None, only_complete: boo
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby("split").agg(
-        n_total=("pid", "size"), n_grade4=("y", "sum"), n_complete=("complete", "sum")
+        n_total=("pid", "size"), n_pos=("y", "sum"), n_complete=("complete", "sum")
     )
-    g["n_complete_grade4"] = df[df.complete].groupby("split")["y"].sum()
+    g["n_complete_pos"] = df[df.complete].groupby("split")["y"].sum()
     return g.fillna(0).astype(int)

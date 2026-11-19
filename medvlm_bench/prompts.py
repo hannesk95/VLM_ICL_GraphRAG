@@ -10,6 +10,14 @@ class TaskSpec:
     pos_text: str  # option for y = 1
     neg_text: str  # option for y = 0
     subject: str
+    # --- wording that differs between tasks (the defaults are the brain / glioma texts, so brain prompts are unchanged)
+    expert: str = "neuroradiologist"
+    target: str = "the WHO CNS grade of the tumour"  # "Predict {target} from the imaging."
+    question: str = "What is the WHO CNS grade of this tumour?"
+    question_short: str = "Classify the glioma."  # prompt variant 1
+    v2_role: str = "a careful neuro-oncology imaging assistant"
+    v2_hint: str = ("Consider contrast enhancement, necrosis, peritumoral oedema, margins and "
+                    "sequence-specific signal before deciding.")
 
 
 GLIOMA_GRADE = TaskSpec(
@@ -24,22 +32,21 @@ PROMPT_VARIANTS = (0, 1, 2)
 
 def system_prompt(task: TaskSpec, layout_text: str, variant: int = 0) -> str:
     if variant == 0:
-        return (f"You are an expert neuroradiologist. You are shown {task.subject}. {layout_text} "
-                f"Predict the WHO CNS grade of the tumour from the imaging. Reply with a single letter.")
+        return (f"You are an expert {task.expert}. You are shown {task.subject}. {layout_text} "
+                f"Predict {task.target} from the imaging. Reply with a single letter.")
     if variant == 1:
         return f"{layout_text} Reply with a single letter."
     if variant == 2:
-        return (f"You are a careful neuro-oncology imaging assistant. The images show {task.subject}. {layout_text} "
-                f"Consider contrast enhancement, necrosis, peritumoral oedema, margins and sequence-specific "
-                f"signal before deciding. Reply with a single letter.")
+        return (f"You are {task.v2_role}. The images show {task.subject}. {layout_text} "
+                f"{task.v2_hint} Reply with a single letter.")
     raise ValueError(variant)
 
 
 def question_text(task: TaskSpec, variant: int, swap: bool) -> str:
     a, b = (task.neg_text, task.pos_text) if swap else (task.pos_text, task.neg_text)
     if variant == 1:
-        return f"Classify the glioma.\nA. {a}\nB. {b}\nAnswer with the letter only."
-    return f"What is the WHO CNS grade of this tumour?\nA. {a}\nB. {b}\nAnswer:"
+        return f"{task.question_short}\nA. {a}\nB. {b}\nAnswer with the letter only."
+    return f"{task.question}\nA. {a}\nB. {b}\nAnswer:"
 
 
 def label_letter(y: int, swap: bool) -> str:

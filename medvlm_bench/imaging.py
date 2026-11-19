@@ -58,11 +58,23 @@ class RenderConfig:
     layout: str = "montage"  # "montage": one image (rows=sequences, cols=slices); "slices": one image per tile
     tile: int = 0  # 0 -> auto so that the montage is ~894 px (MedGemma works on 896x896)
     labels: bool = True
+    # --- multi-dataset extension: the defaults below reproduce the brain behaviour exactly ---------------------------
+    task: str = "brain"  # "brain" -> code path below; any other task -> generic.render_generic
+    plane: str = "axial"  # generic: "axial" or "native" (slice along the through-plane axis of the acquisition)
+    fov: tuple = (0, 0)  # generic: (min, max) side length in mm of the tumour-centred square crop
+    window: tuple = ()  # generic: (lo, hi) display window in native units; () -> percentile normalisation
 
     def key(self) -> str:
+        if self.task == "brain":  # legacy key (same string as before the extension) -> existing render caches stay valid
+            legacy = (f"RenderConfig(seqs={self.seqs!r}, n_slices={self.n_slices!r}, slice_mode={self.slice_mode!r}, "
+                      f"crop={self.crop!r}, layout={self.layout!r}, tile={self.tile!r}, labels={self.labels!r})")
+            return hashlib.md5(legacy.encode()).hexdigest()[:10]
         return hashlib.md5(repr(self).encode()).hexdigest()[:10]
 
     def describe(self) -> str:
+        if self.task != "brain":
+            from .tasks import describe_layout
+            return describe_layout(self)
         cols = f"{self.n_slices} axial slice{'s' if self.n_slices > 1 else ''}"
         order = " (left to right: inferior to superior)" if self.n_slices > 1 else ""
         seqs = ", ".join(self.seqs)
@@ -108,6 +120,9 @@ def _font(size: int):
 
 def render_case(case, cfg: RenderConfig, cache_dir: str | Path | None = None) -> list[Image.Image]:
     """Return a list of RGB PIL images (1 for 'montage', rows*cols for 'slices')."""
+    if cfg.task != "brain":
+        from .generic import render_generic
+        return render_generic(case, cfg, cache_dir)
     cache = Path(cache_dir) if cache_dir else None
     if cache:
         cache.mkdir(parents=True, exist_ok=True)

@@ -18,6 +18,7 @@ from __future__ import annotations
 import numpy as np
 
 from .casegraph import CaseGraph
+from .data import pid_key
 
 STRATEGIES = ("random", "balanced", "knn", "knn_balanced", "mmr", "graph", "graph_balanced")
 
@@ -34,7 +35,7 @@ class ExemplarSelector:
             raise ValueError("graph strategies need a CaseGraph")
 
     def _rng(self, pid: str):
-        return np.random.default_rng([self.seed, int(pid[-4:])])
+        return np.random.default_rng([self.seed, pid_key(pid)])
 
     def _balanced(self, ranking: np.ndarray, k: int) -> list[int]:
         want = {1: (k + 1) // 2, 0: k // 2}

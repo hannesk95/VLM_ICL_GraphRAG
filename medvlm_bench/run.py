@@ -27,10 +27,12 @@ from .casegraph import CaseGraph
 from .data import Case, cases_from_df, index_dataset, summarize
 from .embed import HandcraftedEmbedder
 from .icl import STRATEGIES, ExemplarSelector
+from .data import pid_key
 from .imaging import RenderConfig, compute_case_features, features_to_text, findings_from_features, render_case
 from .kg import KnowledgeGraph, VectorRAG
 from .prompts import GLIOMA_GRADE, TaskSpec, build_messages, n_images, yes_no_messages
 from .promptpdf import messages_to_pdf
+from .tasks import TASKS, adapt_condition, condition_supported, feature_api, get_task, infer_task
 
 try:
     from tqdm import tqdm
@@ -120,20 +122,25 @@ def select_conditions(patterns, registry) -> list[Condition]:
 # ------------------------------------------------------------------------------- context
 class Context:
     def __init__(self, df: pd.DataFrame, scorer, out_dir: Path, embedder=None, task: TaskSpec = GLIOMA_GRADE,
-                 kg_path=None, seed: int = 0, cache_dir=None):
+                 kg_path=None, seed: int = 0, cache_dir=None, task_name: str = "brain"):
         self.df, self.scorer, self.out, self.task = df, scorer, Path(out_dir), task
+        self.task_name = task_name  # brain | head-neck | breast | liver | kidney | soft-tissue (see tasks.py)
+        self._feat_fn, _, _, self._feat_text = feature_api(task_name)
         self.cache = Path(cache_dir) if cache_dir else self.out / "cache"  # fold-independent -> shared across folds
         self.train = cases_from_df(df, "train")
         if not self.train:
             raise SystemExit("No complete TRAIN cases available yet - copy more data or relax --require.")
-        self.embedder = (embedder or HandcraftedEmbedder(self.cache / "features")).fit(self.train)
+        self.embedder = (embedder or HandcraftedEmbedder(self.cache / "features", task=task_name)).fit(self.train)
         self._emb: dict[str, np.ndarray] = {}
         E = self._embed(self.train)
         self.train_emb = E
         self.graph = CaseGraph([c.pid for c in self.train], [c.y for c in self.train], E) if len(self.train) > 8 else None
-        self.kg = KnowledgeGraph.from_json(kg_path) if kg_path else KnowledgeGraph.from_json()
-        self.kg_rewired = self.kg.rewired(seed)
-        self.vec = VectorRAG(self.kg)
+        if task_name == "brain":  # the knowledge graph (WHO CNS5) exists for brain only
+            self.kg = KnowledgeGraph.from_json(kg_path) if kg_path else KnowledgeGraph.from_json()
+            self.kg_rewired = self.kg.rewired(seed)
+            self.vec = VectorRAG(self.kg)
+        else:
+            self.kg = self.kg_rewired = self.vec = None
         self._vlm_find: dict = {}
 
     def _embed(self, cases) -> np.ndarray:
@@ -148,6 +155,12 @@ class Context:
 
     def images(self, case, cfg: RenderConfig):
         return render_case(case, cfg, self.cache / "renders")
+
+    def features(self, case) -> dict:
+        return self._feat_fn(case, self.cache / "features")
+
+    def features_text(self, case) -> str:
+        return self._feat_text(self.features(case))
 
     def seg_findings(self, case):
         return findings_from_features(compute_case_features(case, self.cache / "features"))
@@ -202,19 +215,19 @@ def predict_case(cond: Condition, case: Case, seed: int, ctx: Context, selector:
     if cond.k > 0:
         q_emb = ctx.emb(case)
         shot_cases = selector.select(case, q_emb, cond.k)
-        rng = np.random.default_rng([seed, int(case.pid[-4:]), 7])
+        rng = np.random.default_rng([seed, pid_key(case.pid), 7])
         ys = [int(rng.integers(0, 2)) if cond.shuffle_labels else sc.y for sc in shot_cases]
         for sc, y in zip(shot_cases, ys):
-            ftxt = features_to_text(compute_case_features(sc, ctx.cache / "features")) if cond.shot_format == "findings" else ""
+            ftxt = ctx.features_text(sc) if cond.shot_format == "findings" else ""
             shots.append((ctx.images(sc, cfg), y, ftxt))
         shot_ys = ys
-    q_ftxt = features_to_text(compute_case_features(case, ctx.cache / "features")) if cond.shot_format == "findings" else ""
+    q_ftxt = ctx.features_text(case) if cond.shot_format == "findings" else ""
     evidence = ctx.evidence(cond, case)
 
     ps, mass, nimg = [], [], 0
     for swap in ((False, True) if cond.counterbalance else (False,)):
         msgs = build_messages(ctx.task, layout, q_imgs, shots, evidence, q_ftxt, cond.variant, swap, cond.single_turn)
-        messages_to_pdf(msgs, os.path.join(prompt_dir, f"{cond.name}_prompt_{case.pid}.pdf"), title=f"{cond.name} | {case.pid} (true grade {case.y})")
+        messages_to_pdf(msgs, os.path.join(prompt_dir, f"{cond.name}_prompt_{case.pid}.pdf"), title=f"{cond.name} | {case.pid} (true label y={case.y})")
         lp = ctx.scorer.option_logprobs(msgs, ("A", "B"))
         e = np.exp(lp - lp.max())
         pA = float(e[0] / e.sum())
@@ -282,10 +295,10 @@ def run_references(ctx: Context, split: str, limit: int | None = None):
 
 
 # ------------------------------------------------------------------------------- CLI
-def _make_df(args) -> pd.DataFrame:
+def _make_df(args, task: str = "brain") -> pd.DataFrame:
     req = tuple(args.require.split(",")) if args.require else ("T1c", "FLAIR", "T2")
     return index_dataset(args.root, required_seqs=req, require_seg=not args.no_seg_required, seed=args.split_seed,
-                         n_folds=args.n_folds, fold=args.fold, val_fraction=args.val_fraction)
+                         n_folds=args.n_folds, fold=args.fold, val_fraction=args.val_fraction, task=task)
 
 
 def _make_scorer(args):
@@ -299,10 +312,14 @@ def _make_scorer(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="medvlm_bench.run")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("list", help="list all registered conditions")
+    pl = sub.add_parser("list", help="list all registered conditions")
+    pl.add_argument("--task", default=None, choices=list(TASKS), help="only the conditions that exist for this task")
     for name in ("index", "run", "refs"):
         p = sub.add_parser(name)
-        p.add_argument("--root", required=True, help="folder with UCSF-PDGM-metadata*.xlsx and MRI/")
+        p.add_argument("--root", required=True,
+                       help="dataset folder: brain = UCSF-PDGM-metadata*.xlsx + MRI/; others = data/<task>")
+        p.add_argument("--task", default=None, choices=list(TASKS),
+                       help="brain | head-neck | breast | liver | kidney | soft-tissue (default: from the --root folder name)")
         p.add_argument("--out", required=True)
         p.add_argument("--require", default="", help="comma-separated sequences every case must have (default T1c,FLAIR,T2)")
         p.add_argument("--no-seg-required", action="store_true")
@@ -326,6 +343,8 @@ def main(argv=None):
     reg = build_registry()
     if a.cmd == "list":
         for n, c in reg.items():
+            if a.task and not condition_supported(c, a.task):
+                continue
             print(f"{n:38s} k={c.k} sel={c.selector if c.k else '-':14s} rag={c.rag:12s} seeds={list(c.seeds)}")
         return
 
@@ -337,7 +356,10 @@ def main(argv=None):
     cache = out / "cache"  # renders / features / VLM findings do not depend on the fold -> shared
     if a.n_folds:
         out = out / f"fold{a.fold}"; out.mkdir(parents=True, exist_ok=True)
-    df = _make_df(a)
+    task = a.task or infer_task(a.root)
+    tdef = get_task(task)
+    print(f"task: {task}  (positive class y=1: {tdef.positive})")
+    df = _make_df(a, task)
     df.to_csv(out / "index.csv", index=False)
     print(summarize(df).to_string())
     if a.cmd == "index":
@@ -346,12 +368,20 @@ def main(argv=None):
     emb = None
     if a.embedder == "medsiglip":
         from .embed import MedSigLIPEmbedder
-        emb = MedSigLIPEmbedder(RenderConfig(), cache_dir=cache / "renders")
-    ctx = Context(df, scorer, out, emb, seed=a.split_seed, cache_dir=cache)
+        emb = MedSigLIPEmbedder(tdef.base_render() if task != "brain" else RenderConfig(), cache_dir=cache / "renders")
+    ctx = Context(df, scorer, out, emb, task=tdef.prompt, seed=a.split_seed, cache_dir=cache, task_name=task)
     if a.cmd == "refs":
         run_references(ctx, a.split, a.limit)
         return
-    for cond in select_conditions(a.conditions, reg):
+    conds = select_conditions(a.conditions, reg)
+    skipped = [c.name for c in conds if not condition_supported(c, task)]
+    if skipped:
+        print(f"skipping {len(skipped)} condition(s) that do not exist for task '{task}' (KG / brain-only): "
+              + ", ".join(skipped[:6]) + (" ..." if len(skipped) > 6 else ""))
+    conds = [adapt_condition(c, task) for c in conds if condition_supported(c, task)]
+    if not conds:
+        raise SystemExit(f"No selected condition is available for task '{task}'.")
+    for cond in conds:
         run_condition(cond, a.split, ctx, a.limit, a.seed)
 
 

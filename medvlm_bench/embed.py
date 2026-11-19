@@ -21,15 +21,21 @@ def _l2(x: np.ndarray) -> np.ndarray:
 class HandcraftedEmbedder:
     name = "handcrafted"
 
-    def __init__(self, cache_dir=None):
+    def __init__(self, cache_dir=None, task: str = "brain"):
         self.cache_dir = cache_dir
+        self.task = task
         self.mu = self.sd = self.fill = None
+        if task == "brain":  # unchanged behaviour
+            self.feature_fn, self.keys, self.log_keys = compute_case_features, FEATURE_KEYS, _LOG_KEYS
+        else:  # generic mask-derived descriptors of the other tasks
+            from .tasks import feature_api
+            self.feature_fn, self.keys, self.log_keys, _ = feature_api(task)
 
     def _raw(self, cases) -> np.ndarray:
         rows = []
         for c in cases:
-            f = compute_case_features(c, self.cache_dir)
-            rows.append([np.log1p(f[k]) if k in _LOG_KEYS and np.isfinite(f[k]) else f[k] for k in FEATURE_KEYS])
+            f = self.feature_fn(c, self.cache_dir)
+            rows.append([np.log1p(f[k]) if k in self.log_keys and np.isfinite(f[k]) else f[k] for k in self.keys])
         return np.asarray(rows, dtype=np.float64)
 
     def fit(self, train_cases):
