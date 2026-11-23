@@ -254,9 +254,89 @@ THRESH = dict(
 )
 
 
-def findings_from_features(f: dict) -> dict[str, bool]:
-    """Map quantitative descriptors to KG imaging-feature ids (only those derivable from a mask)."""
-    T = THRESH
+# threshold -> (feature it is applied to, how it is fitted); everything else stays at its a-priori value
+#   enh_ml_none is a segmentation noise floor (detection limit), deliberately NOT fitted on labels.
+_FIT_SPEC = {
+    "necrosis_ml": "necrosis_ml", "necrosis_frac_core": "necrosis_frac_core", "edema_ml_large": "edema_ml",
+    "minor_side_midline": "frac_minor_side", "enh_ml_avid": "enh_ml", "enh_ml_ring": "enh_ml", "rim_frac": "rim_frac",
+}
+
+
+def _youden_cut(x, y, min_per_class: int = 5):
+    """Cut-off t maximising TPR-FPR for the rule ``x >= t`` => positive (grade 4).
+
+    Returns (t, auc) or None if the feature cannot be fitted (too few cases per class / constant feature).
+    Candidate cuts are midpoints between consecutive distinct training values, so the rule is robust to ties.
+    """
+    x, y = np.asarray(x, float), np.asarray(y, int)
+    m = np.isfinite(x)
+    x, y = x[m], y[m]
+    if (y == 1).sum() < min_per_class or (y == 0).sum() < min_per_class or np.ptp(x) == 0:
+        return None
+    u = np.unique(x)
+    cuts = np.r_[u[0] - 1e-9, (u[1:] + u[:-1]) / 2.0]
+    pos, neg = x[y == 1], x[y == 0]
+    tpr = np.array([(pos >= c).mean() for c in cuts])
+    fpr = np.array([(neg >= c).mean() for c in cuts])
+    j = tpr - fpr
+    # rank-based AUC (Mann-Whitney) to detect a feature that points the "wrong" way
+    r = np.argsort(np.argsort(np.r_[pos, neg], kind="stable"), kind="stable") + 1.0
+    auc = (r[: len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg))
+    return float(cuts[int(np.argmax(j))]), float(auc)
+
+
+def fit_thresholds(feats: list[dict], y, base: dict | None = None, min_per_class: int = 5, verbose: bool = True) -> dict:
+    """Fit the findings thresholds on TRAINING cases only (call it once per CV fold, never on test cases).
+
+    feats: one feature dict per training case (``compute_case_features``), y: 1 = grade 4, 0 = grade 2/3.
+    Each cut-off is the Youden-J optimum of the rule "feature >= t  =>  finding present" against the grade label.
+    Safeguards: a threshold keeps its a-priori value (and is reported as such) if the feature is missing/constant,
+    a class has < ``min_per_class`` cases, or the feature points the wrong way (AUC < 0.5, i.e. the finding would
+    contradict its clinical meaning). ``enh_ml_ring`` is fitted among cases that have a necrotic core (a ring needs
+    one) and is capped at ``enh_ml_avid``; ``rim_frac`` among cases with both necrosis and enhancement.
+    Returns a full THRESH-like dict plus ``_report`` (not used by findings_from_features).
+    """
+    T = dict(THRESH if base is None else base)
+    y = np.asarray(y, int)
+    col = lambda k: np.array([float(f.get(k, np.nan)) for f in feats])  # noqa: E731
+    report = {}
+
+    def fit(key, feat, subset=None):
+        x, yy = col(feat), y
+        if subset is not None:
+            x, yy = x[subset], y[subset]
+        res = _youden_cut(x, yy, min_per_class)
+        if res is None:
+            report[key] = dict(value=T[key], source="a-priori (too few cases / constant feature)")
+        elif res[1] < 0.5:
+            report[key] = dict(value=T[key], source=f"a-priori (feature points the wrong way, AUC={res[1]:.2f})", auc=res[1])
+        else:
+            d = 2 if "frac" in key else 1
+            T[key] = round(res[0], d)
+            report[key] = dict(value=T[key], source="fitted", auc=round(res[1], 3), n=int(np.isfinite(x).sum()))
+
+    for key in ("necrosis_ml", "necrosis_frac_core", "edema_ml_large", "minor_side_midline", "enh_ml_avid"):
+        fit(key, _FIT_SPEC[key])
+    nec_ok = col("necrosis_ml") >= T["necrosis_ml"]
+    fit("enh_ml_ring", "enh_ml", subset=nec_ok)
+    if T["enh_ml_ring"] > T["enh_ml_avid"]:  # a ring cannot need more enhancement than "avid" enhancement
+        T["enh_ml_ring"] = T["enh_ml_avid"]
+        report["enh_ml_ring"]["value"], report["enh_ml_ring"]["source"] = T["enh_ml_ring"], "capped at enh_ml_avid"
+    fit("rim_frac", "rim_frac", subset=nec_ok & (col("enh_ml") >= T["enh_ml_none"]))
+    report["enh_ml_none"] = dict(value=T["enh_ml_none"], source="a-priori (noise floor, never fitted)")
+    T["_report"] = report
+    if verbose:
+        print("fitted thresholds (train only):")
+        for k, r in report.items():
+            print(f"  {k:20s} {r['value']:>7}  [{r['source']}]  (a-priori {THRESH[k]})")
+    return T
+
+
+def findings_from_features(f: dict, thresh: dict | None = None) -> dict[str, bool]:
+    """Map quantitative descriptors to KG imaging-feature ids (only those derivable from a mask).
+
+    thresh: THRESH-like dict (e.g. from ``fit_thresholds``); None = the a-priori ``THRESH``."""
+    T = THRESH if thresh is None else thresh
     g = lambda k: f.get(k, float("nan"))  # noqa: E731
     ok = lambda *ks: all(np.isfinite(g(k)) for k in ks)  # noqa: E731
     out: dict[str, bool] = {}

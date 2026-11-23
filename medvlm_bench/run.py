@@ -28,7 +28,8 @@ from .data import Case, cases_from_df, index_dataset, summarize
 from .embed import HandcraftedEmbedder
 from .icl import STRATEGIES, ExemplarSelector
 from .data import pid_key
-from .imaging import RenderConfig, compute_case_features, features_to_text, findings_from_features, render_case
+from .imaging import (THRESH, RenderConfig, compute_case_features, features_to_text, findings_from_features,
+                      fit_thresholds, render_case)
 from .kg import KnowledgeGraph, VectorRAG
 from .prompts import GLIOMA_GRADE, TaskSpec, build_messages, n_images, yes_no_messages
 from .promptpdf import messages_to_pdf
@@ -104,11 +105,6 @@ def build_registry() -> dict[str, Condition]:
                     rag="graph", findings_source="seg",
                     render=RenderConfig(layout="slices")))
 
-    for k in (1, 2, 3, 4, 5, 8, 10):
-        add(Condition(f"combo_graph_seg_icl_knn_k{k}_multiimage", k=k, selector="knn_balanced",
-                    rag="graph", findings_source="seg",
-                    render=RenderConfig(layout="slices")))
-
     return R
 
 
@@ -127,7 +123,7 @@ def select_conditions(patterns, registry) -> list[Condition]:
 # ------------------------------------------------------------------------------- context
 class Context:
     def __init__(self, df: pd.DataFrame, scorer, out_dir: Path, embedder=None, task: TaskSpec = GLIOMA_GRADE,
-                 kg_path=None, seed: int = 0, cache_dir=None, task_name: str = "brain"):
+                 kg_path=None, seed: int = 0, cache_dir=None, task_name: str = "brain", thresholds: str = "fixed"):
         self.df, self.scorer, self.out, self.task = df, scorer, Path(out_dir), task
         self.task_name = task_name  # brain | head-neck | breast | liver | kidney | soft-tissue (see tasks.py)
         self._feat_fn, _, _, self._feat_text = feature_api(task_name)
@@ -147,6 +143,15 @@ class Context:
         else:
             self.kg = self.kg_rewired = self.vec = None
         self._vlm_find: dict = {}
+        # findings thresholds: a-priori (fixed) or fitted on THIS fold's training cases only (fit); brain/KG only
+        self.thresholds_mode = thresholds if task_name == "brain" else "fixed"
+        self.thresh = dict(THRESH)
+        if self.thresholds_mode == "fit":
+            feats = [compute_case_features(c, self.cache / "features") for c in self.train]
+            self.thresh = fit_thresholds(feats, [c.y for c in self.train])
+        (self.out / f"thresholds_{self.thresholds_mode}.json").write_text(json.dumps(
+            {"mode": self.thresholds_mode, "n_train": len(self.train),
+             **{k: v for k, v in self.thresh.items()}}, indent=1, default=float))
 
     def _embed(self, cases) -> np.ndarray:
         miss = [c for c in cases if c.pid not in self._emb]
@@ -168,7 +173,7 @@ class Context:
         return self._feat_text(self.features(case))
 
     def seg_findings(self, case):
-        return findings_from_features(compute_case_features(case, self.cache / "features"))
+        return findings_from_features(compute_case_features(case, self.cache / "features"), self.thresh)
 
     def vlm_findings(self, case, cfg: RenderConfig) -> dict[str, float]:
         """P(feature present) per KG feature, from yes/no probes of the VLM itself (cached)."""
@@ -341,6 +346,9 @@ def main(argv=None):
             p.add_argument("--model-id", default="google/medgemma-1.5-4b-it")
             p.add_argument("--embedder", default="medsiglip", choices=["handcrafted", "medsiglip"])
         if name == "run":
+            p.add_argument("--thresholds", default="fixed", choices=["fixed", "fit"],
+                           help="seg-finding thresholds of the KG conditions: a-priori values (fixed) or Youden cut-offs "
+                                "fitted on the training cases of this fold only (fit; brain only)")
             p.add_argument("--conditions", nargs="+", required=True, help="names or fnmatch patterns")
             p.add_argument("--seed", type=int, default=None, help="run a single seed of stochastic conditions")
     a = ap.parse_args(argv)
@@ -374,7 +382,8 @@ def main(argv=None):
     if a.embedder == "medsiglip":
         from .embed import MedSigLIPEmbedder
         emb = MedSigLIPEmbedder(tdef.base_render() if task != "brain" else RenderConfig(), cache_dir=cache / "renders")
-    ctx = Context(df, scorer, out, emb, task=tdef.prompt, seed=a.split_seed, cache_dir=cache, task_name=task)
+    ctx = Context(df, scorer, out, emb, task=tdef.prompt, seed=a.split_seed, cache_dir=cache, task_name=task,
+                  thresholds=getattr(a, "thresholds", "fixed"))
     if a.cmd == "refs":
         run_references(ctx, a.split, a.limit)
         return
@@ -386,6 +395,9 @@ def main(argv=None):
     conds = [adapt_condition(c, task) for c in conds if condition_supported(c, task)]
     if not conds:
         raise SystemExit(f"No selected condition is available for task '{task}'.")
+    if ctx.thresholds_mode == "fit":  # only conditions whose evidence uses the seg findings depend on the thresholds
+        conds = [replace(c, name=c.name + "_thrfit") if c.rag != "none" and c.findings_source in ("seg", "both") else c
+                 for c in conds]  # separate prediction files: fixed and fitted runs can share one --out
     for cond in conds:
         run_condition(cond, a.split, ctx, a.limit, a.seed)
 
