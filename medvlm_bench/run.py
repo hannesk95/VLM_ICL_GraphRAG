@@ -100,8 +100,8 @@ def build_registry() -> dict[str, Condition]:
         add(Condition(f"combo_graph_vlm_icl_graph_k{k}", k=k, selector="graph",
                     rag="graph", findings_source="vlm"))
 
-    for k in (1, 2, 4, 8):
-        add(Condition(f"combo_graph_seg_icl_graph_k{k}_multiimage", k=k, selector="graph",
+    for k in (1, 2, 3, 4, 5, 8, 10):
+        add(Condition(f"combo_graph_seg_icl_knn_k{k}_multiimage", k=k, selector="knn_balanced",
                     rag="graph", findings_source="seg",
                     render=RenderConfig(layout="slices")))
 
